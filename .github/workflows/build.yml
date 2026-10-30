@@ -109,6 +109,20 @@ jobs:
               sys.exit('no embedded BTF found in Image')
           PY
 
+      - name: Dump BTF blob (for reuse without rebuilding)
+        run: |
+          if [ -x "$RUNNER_TEMP/clang/bin/llvm-objcopy" ]; then
+            "$RUNNER_TEMP/clang/bin/llvm-objcopy" --dump-section .BTF=btf.bin kernel/vmlinux
+          else
+            objcopy --dump-section .BTF=btf.bin kernel/vmlinux
+          fi
+          ls -lh btf.bin
+          python3 - <<'PY'
+          d=open('btf.bin','rb').read()
+          assert d[:2]==b'\x9f\xeb', 'not a BTF blob'
+          print('BTF header ok, size', len(d))
+          PY
+
       - name: Build extractor
         run: |
           cargo build --release --manifest-path extract_rs/Cargo.toml
@@ -137,5 +151,5 @@ jobs:
             profile.conf
             profile.raw.conf
             extract.log
-            kernel/.config
+            btf.bin
           if-no-files-found: error
