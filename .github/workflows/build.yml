@@ -1,0 +1,141 @@
+name: build-gki-5.10.233-btf-profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'configs/**'
+      - 'extract_rs/**'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves lz4 zstd cpio rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          pahole --version
+          df -h /
+
+      - name: Install Rust (edition 2024)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Fetch AOSP clang r416183b (matches device build toolchain)
+        run: |
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android-gs-raviole-5.10-android12-qpr3/clang-r416183b.tar.gz" \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version
+
+      - name: Clone GKI android12-5.10.233
+        run: |
+          git clone --depth 1 --branch android12-5.10.233_r00 \
+            https://android.googlesource.com/kernel/common kernel
+
+      - name: Configure kernel (device config + BTF)
+        run: |
+          cp configs/pd2256_defconfig kernel/arch/arm64/configs/pd2256_defconfig
+          cd kernel
+          make ARCH=arm64 LLVM=1 pd2256_defconfig
+          # Struct layout only depends on the config switches that add/remove
+          # fields. LTO/CFI never reorder struct members, and full LTO + DWARF
+          # does not fit a hosted runner, so they are disabled for the build.
+          ./scripts/config \
+            -e DEBUG_INFO \
+            -e DEBUG_INFO_DWARF4 \
+            -e DEBUG_INFO_BTF \
+            -d DEBUG_INFO_BTF_MODULES \
+            -d DEBUG_INFO_REDUCED \
+            -d DEBUG_INFO_SPLIT \
+            -d LTO \
+            -d LTO_CLANG \
+            -d LTO_CLANG_FULL \
+            -d LTO_CLANG_THIN \
+            -d CFI_CLANG \
+            -d CFI_CLANG_SHADOW \
+            -d WERROR \
+            --set-str SYSTEM_TRUSTED_KEYS "" \
+            --set-str SYSTEM_REVOCATION_KEYS ""
+          make ARCH=arm64 LLVM=1 olddefconfig
+          grep -E "^CONFIG_(DEBUG_INFO|DEBUG_INFO_DWARF4|DEBUG_INFO_BTF|LTO|CFI_CLANG|LOCALVERSION|WERROR)" .config || true
+          echo "----- kernelrelease -----"
+          make ARCH=arm64 LLVM=1 kernelrelease || true
+          echo "----- config symbols dropped by olddefconfig -----"
+          grep -oE '^CONFIG_[A-Z0-9_]+=' ../configs/pd2256_defconfig | sort -u > /tmp/want.txt
+          grep -oE '^CONFIG_[A-Z0-9_]+=' .config | sort -u > /tmp/built.txt
+          comm -23 /tmp/want.txt /tmp/built.txt | tee /tmp/dropped.txt | head -80
+          echo "dropped count: $(wc -l < /tmp/dropped.txt)"
+
+      - name: Build Image
+        run: |
+          cd kernel
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 Image
+          ls -lh arch/arm64/boot/Image
+          df -h /
+
+      - name: Verify BTF inside Image
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          data = open('kernel/arch/arm64/boot/Image','rb').read()
+          sig = b'\x9f\xeb\x01\x00\x18\x00\x00\x00'
+          hits = [m.start() for m in re.finditer(re.escape(sig), data)]
+          print('BTF magic hits:', len(hits))
+          if not hits:
+              sys.exit('no embedded BTF found in Image')
+          PY
+
+      - name: Build extractor
+        run: |
+          cargo build --release --manifest-path extract_rs/Cargo.toml
+          ls -lh extract_rs/target/release/ghostlock-extract
+
+      - name: Generate GhostLock profile
+        run: |
+          set -o pipefail
+          ./extract_rs/target/release/ghostlock-extract \
+            kernel/arch/arm64/boot/Image \
+            --format conf \
+            --phys 0xa8000000 \
+            --out profile.raw.conf 2>&1 | tee extract.log
+          echo "----- rewrite release to device uname -r -----"
+          sed 's/^release = .*/release = "5.10.233-gki-g32ba094b20cd"/' profile.raw.conf > profile.conf
+          echo "----- profile head -----"
+          sed -n '1,80p' profile.conf
+          echo "----- null fields -----"
+          grep -n "null" profile.conf || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostlock-5.10.233-profile
+          path: |
+            profile.conf
+            profile.raw.conf
+            extract.log
+            kernel/.config
+          if-no-files-found: error
