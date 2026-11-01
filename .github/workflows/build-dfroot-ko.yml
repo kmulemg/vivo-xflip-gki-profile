@@ -1,0 +1,120 @@
+name: build-dfroot-ko
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'lkm/**'
+      - 'configs/**'
+      - '.github/workflows/build-dfroot-ko.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves lz4 zstd cpio rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          df -h /
+
+      - name: Fetch AOSP clang r416183b
+        run: |
+          mkdir -p "$RUNNER_TEMP/clang"
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android-gs-raviole-5.10-android12-qpr3/clang-r416183b.tar.gz" \
+            -o "$RUNNER_TEMP/clang.tar.gz"
+          tar -xzf "$RUNNER_TEMP/clang.tar.gz" -C "$RUNNER_TEMP/clang"
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version
+
+      - name: Clone GKI android12-5.10.233
+        run: |
+          git clone --depth 1 --branch android12-5.10.233_r00 \
+            https://android.googlesource.com/kernel/common kernel
+
+      - name: Configure kernel (match device vermagic + MODVERSIONS)
+        run: |
+          cp configs/pd2256_defconfig kernel/arch/arm64/configs/pd2256_defconfig
+          cd kernel
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- pd2256_defconfig
+          # 不需要 BTF/DWARF/LTO/CFI，只要和内核一致的 MODVERSIONS 与 UTS_RELEASE
+          ./scripts/config \
+            -d DEBUG_INFO -d DEBUG_INFO_BTF -d DEBUG_INFO_DWARF4 \
+            -d LTO -d LTO_CLANG -d LTO_CLANG_FULL -d LTO_CLANG_THIN \
+            -d CFI_CLANG -d CFI_CLANG_SHADOW -d WERROR \
+            -e MODULES -e MODULE_UNLOAD -e MODVERSIONS -d MODULE_SIG \
+            -d LOCALVERSION_AUTO \
+            --set-str LOCALVERSION "-gki-g32ba094b20cd" \
+            --set-str SYSTEM_TRUSTED_KEYS "" \
+            --set-str SYSTEM_REVOCATION_KEYS ""
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          grep -E "^CONFIG_(MODULES|MODULE_UNLOAD|MODVERSIONS|LOCALVERSION|LOCALVERSION_AUTO)=" .config
+          echo "----- kernelrelease（必须等于 5.10.233-gki-g32ba094b20cd）-----"
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease
+          # vivo 把 arm64 的 MODULE_ARCH_VERMAGIC 改成了 "vivo aarch64"，必须一致
+          sed -i 's/#define MODULE_ARCH_VERMAGIC\t"aarch64"/#define MODULE_ARCH_VERMAGIC\t"vivo aarch64"/' arch/arm64/include/asm/vermagic.h
+          grep MODULE_ARCH_VERMAGIC arch/arm64/include/asm/vermagic.h
+
+      - name: Build kernel + modules (generates Module.symvers with CRCs)
+        run: |
+          cd kernel
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- Image modules
+          ls -lh arch/arm64/boot/Image Module.symvers
+          wc -l Module.symvers
+          df -h /
+
+      - name: Build dfroot.ko
+        run: |
+          make -C lkm KDIR="$PWD/kernel" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            OBJCOPY="$RUNNER_TEMP/clang/bin/llvm-objcopy"
+          ls -lh lkm/dfroot.ko
+
+      - name: Verify vermagic matches the device
+        run: |
+          set -e
+          WANT='5.10.233-gki-g32ba094b20cd SMP preempt mod_unload modversions vivo aarch64'
+          GOT=$(python3 - <<'PY'
+          import re
+          d=open('lkm/dfroot.ko','rb').read()
+          m=re.search(rb'vermagic=([^\x00]+)', d)
+          print(m.group(1).decode())
+          PY
+          )
+          echo "want: $WANT"
+          echo "got : $GOT"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::vermagic mismatch"
+            exit 1
+          fi
+          echo "vermagic OK"
+          # 确认 bootstrap 路径已改成淡漠的
+          python3 - <<'PY'
+          d=open('lkm/dfroot.ko','rb').read()
+          assert b'/data/user/0/df.r/dsh' in d, 'bootstrap path missing'
+          print('bootstrap path OK')
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfroot-ko-5.10.233
+          path: |
+            lkm/dfroot.ko
+            kernel/Module.symvers
+          if-no-files-found: error
