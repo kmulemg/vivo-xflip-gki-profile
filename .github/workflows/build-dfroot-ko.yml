@@ -64,11 +64,17 @@ jobs:
             --set-str SYSTEM_REVOCATION_KEYS ""
           make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           grep -E "^CONFIG_(MODULES|MODULE_UNLOAD|MODVERSIONS|LOCALVERSION|LOCALVERSION_AUTO)=" .config
-          echo "----- kernelrelease（必须等于 5.10.233-gki-g32ba094b20cd）-----"
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease
           # vivo 把 arm64 的 MODULE_ARCH_VERMAGIC 改成了 "vivo aarch64"，必须一致
           sed -i 's/#define MODULE_ARCH_VERMAGIC\t"aarch64"/#define MODULE_ARCH_VERMAGIC\t"vivo aarch64"/' arch/arm64/include/asm/vermagic.h
           grep MODULE_ARCH_VERMAGIC arch/arm64/include/asm/vermagic.h
+          # kbuild 会给"有未提交改动"的树加上 "+" 后缀（见 scripts/setlocalversion），
+          # 先把改动提交掉，再删掉已生成的 utsrelease.h 让它重新计算
+          git add arch/arm64/include/asm/vermagic.h
+          git -c user.name=ci -c user.email=ci@localhost commit -q -m "local: vivo vermagic" || true
+          rm -f include/generated/utsrelease.h include/config/kernel.release
+          echo "----- kernelrelease（必须等于 5.10.233-gki-g32ba094b20cd）-----"
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- kernelrelease | tee /tmp/krel.txt
+          if grep -q '+' /tmp/krel.txt; then echo "::error::kernelrelease has '+' (dirty tree)"; exit 1; fi
 
       - name: Build kernel + modules (generates Module.symvers with CRCs)
         run: |
